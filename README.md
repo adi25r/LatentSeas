@@ -127,36 +127,7 @@ The backend provides a RESTful API:
 4. **Generate** - Hit generate to see what text the model creates with your placed flags
 5. **Experiment** - Try different combinations and see what happens!
 
-## How Steering Works (and how it broke)
-
-The first version of this produced nonsense at every setting. Four separate bugs, all
-now fixed and pinned by `src/model/diagnose.py`:
-
-**1. The probe returned the same features for every sentence.** Ranking took the max
-activation across all positions, including BOS. The BOS residual stream is an outlier
-that makes the SAE fire a fixed set of features at ~420 magnitude, while real content
-features fire at ~20-50. So BOS won every ranking, and `"the rabid dog"` and
-`"quantum chromodynamics"` both returned features `[23123, 979, 316, 7496, 23111]`.
-Fixed by dropping position 0 in `get_feature_activations`.
-
-**2. Boosting multiplied by zero.** Steering did `feature_acts[:, :, idx] *= n`. SAE
-activations are sparse — only ~0.17% of the 24,576 features are on at any position. A
-feature that is off is exactly `0.0`, and `0 * 30` is still `0`. The only place those
-BOS features were nonzero was BOS itself, so the multiplier injected a ~6000-magnitude
-spike at the one position that derails generation. Bigger multiplier, worse output.
-Steering is now additive: `resid += strength * W_dec[feature]`, skipping BOS.
-
-**3. The residual stream was replaced by its reconstruction.** The hook returned
-`sae.decode(sae.encode(x))` on every forward pass. That round trip loses ~24% of the
-residual norm (cosine 0.966) and raised CE loss from 2.16 to 2.45 *with no features
-selected*. The fix adds a vector rather than substituting a lossy reconstruction, so
-zero flags is now exactly the clean model.
-
-**4. The map only held features 0-499.** Probes surface features anywhere in 0-24,575,
-so flagged features were almost never on the map. The pointmap now covers all features
-and is cached to `src/backend/pointmap_cache.npy` (~20s on first startup).
-
-### Picking a strength
+## How Steering Works
 
 `W_dec` rows are unit norm, so strength is in residual-norm units and is directly
 comparable to how hard a feature naturally fires:
@@ -168,20 +139,7 @@ comparable to how hard a feature naturally fires:
 The probe reports each feature's own activation as `suggested_strength`, which is a good
 default: it asks the feature to fire about as hard as it did in your probe sentence.
 
-### It was never the model
-
-Scaling to a bigger model would not have helped, and GPT-3 has neither open weights nor
-public SAEs. GPT-2 small steers fine once the pipeline is correct — probing
-`"she wept bitterly at the funeral"` and generating from `"Once upon a time"` now yields
-*"when the body of a person is for home for the family of loved one"*. If you do want a
-larger model later, the realistic option is Gemma-2-2b with GemmaScope SAEs, which
-`sae_lens` already supports.
-
 ## Scoring
-
-Word error rate is the wrong measure here: these features are semantic directions, not
-word triggers, so an on-target run rarely reproduces the target's exact wording. Scoring
-is cosine similarity instead (`src/model/scoring.py`).
 
 The embeddings are GPT-2's own token table `W_E` — a word2vec-style matrix that is
 already loaded, so nothing extra is downloaded. Mean-pooling it raw does not work: every
@@ -205,52 +163,3 @@ inflates all scores and compresses the ranking (measured: 45% narrower spread).
 `scoring.py` is modular like `embeddings.py`. `get_scorer("sae", explorer=ex)` swaps in
 cosine similarity over SAE feature activations instead, scoring how close you landed in
 latent space rather than in word space.
-
-## Terrain and navigation
-
-Height is a KDE over feature positions (`src/model/terrain.py`). Evaluating a gaussian
-KDE directly is O(grid x points) — 400M operations for a 128x128 grid over 24k features —
-so it bins the points into a 2D histogram and gaussian-blurs it, which is the same thing
-for a gaussian kernel and runs in 3ms.
-
-The terrain is computed server-side and sent as a heightmap grid. That matters: the
-frontend previously found each vertex's height by scanning every feature for the nearest
-one, which is 61M distance checks once the map holds all 24,576 features. It also drew one
-mesh per feature; markers are now a single `THREE.Points` draw call.
-
-### Spacing the features out
-
-Scaling the world alone does not make features clickable: UMAP output is clumpy, so a
-uniform scale enlarges the clumps too and local crowding is unchanged. Two things run in
-sequence (`src/model/terrain.py`):
-
-1. `spread_positions` maps the embedding into a `WORLD_SIZE` square, using percentiles
-   rather than min/max so outliers cannot squash everything into the middle
-2. `relax_positions` pushes apart any pair closer than `MIN_FEATURE_GAP`, which loosens
-   tight clusters while leaving the global layout intact
-
-| | crowded pairs (<0.3 apart) | median gap |
-|---|---|---|
-| raw scale-up, 120 units | 66.7% | 0.219 |
-| + relaxation, 160 units | 3.4% | 0.654 |
-
-Median layout drift from relaxation is 0.2% of the world, so the map still means what the
-embedding says. About 1.7% of features stay crowded — those are near-duplicate decoder
-directions that cannot be separated without distorting the layout.
-
-Features render as lit 3D icosahedra via a single `InstancedMesh`, so 24k of them are one
-draw call and still have real depth and shading. Hovering highlights the feature under the
-cursor and names it in the HUD, and probed or flagged features win ties when several are
-under the cursor at once.
-
-**Controls:** W/A/S/D move, arrow keys look, Shift sprints, F toggles fly mode, Q/Space
-and E go up and down while flying, right-drag is mouse look, left-click a dot flags it.
-
-`node src/frontend/navigation.test.js` checks the movement math by loading `app.js` in a
-VM, so it verifies the shipped code rather than a copy. It pins the two bugs that made
-navigation feel wrong: the strafe vector was `(cos, 0, -sin)` when the right-handed
-`cross(forward, up)` is `(-cos, 0, sin)`, which swapped A and D; and pitch was applied as
-negative-is-up, which inverted the up and down arrows.
-
-Run `python src/model/diagnose.py` to re-verify the steering and scoring work, and
-`node src/frontend/navigation.test.js` for the navigation math.
