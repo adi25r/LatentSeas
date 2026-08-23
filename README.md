@@ -133,14 +133,9 @@ The backend provides a RESTful API:
 ## Scoring
 
 The embeddings are GPT-2's own token table `W_E` — a word2vec-style matrix that is
-already loaded, so nothing extra is downloaded. Mean-pooling it raw does not work: every
-pair lands between 0.58 and 0.84 because frequent function words dominate the average,
-and "she wept at the funeral" vs "compile the kernel" scored 0.68. Two corrections fix it:
-
+already loaded. 
 1. subtract the vocabulary-mean embedding, removing the shared common direction
 2. drop stopword tokens and unit-normalize the rest before averaging
-
-That widens the gap between paraphrases and unrelated text from 0.09 to 0.16 cosine:
 
 | | score |
 |---|---|
@@ -148,8 +143,7 @@ That widens the gap between paraphrases and unrelated text from 0.09 to 0.16 cos
 | paraphrase | 35-70 |
 | unrelated | 4-16 |
 
-The prompt is stripped before scoring. It is common to every attempt, so leaving it in
-inflates all scores and compresses the ranking (measured: 45% narrower spread).
+The prompt is stripped before scoring. 
 
 `scoring.py` is modular like `embeddings.py`. `get_scorer("sae", explorer=ex)` swaps in
 cosine similarity over SAE feature activations instead, scoring how close you landed in
