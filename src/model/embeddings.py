@@ -4,7 +4,6 @@ from abc import ABC, abstractmethod
 from sklearn.decomposition import PCA
 import umap
 
-
 class FeatureEmbedder(ABC):
     @abstractmethod
     def compute_embedding(self, feature_weights: torch.Tensor) -> np.ndarray:

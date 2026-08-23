@@ -110,6 +110,22 @@ class LatentExplorer:
 
         return results
 
+    def probe(self, text: str, top_k: int = 64, eligible=None):
+        """Features this text activates, ranked by raw activation.
+
+        Returns a list of (feature_idx, activation), strongest first.
+        """
+        peak = self.get_feature_activations(text).max(dim=0).values
+
+        score = peak
+        if eligible is not None:
+            mask = torch.as_tensor(eligible, dtype=torch.bool, device=peak.device)
+            score = score.masked_fill(~mask, float("-inf"))
+
+        top = torch.topk(score, min(top_k, score.shape[0]))
+        return [(i, v) for i, v in zip(top.indices.tolist(), top.values.tolist())
+                if v != float("-inf")]
+
     def steering_vector(self, boosted_features: Dict[int, float]) -> torch.Tensor:
         """Sum of decoder directions, each scaled by its strength. W_dec rows are unit norm,
         so strength is in residual-norm units (content features naturally fire at ~20-50)."""
@@ -118,39 +134,38 @@ class LatentExplorer:
             steer = steer + strength * self.sae.W_dec[feat_idx]
         return steer
 
+    MAX_STEER_RATIO = 1.5
+
     def generate_with_boosted_features(self, prompt: str, boosted_features: Dict[int, float],
-        max_new_tokens: int = 50, temperature: float = 0.7) -> str:
+        max_new_tokens: int = 50, temperature: float = 0.7,
+        max_steer_ratio: float = None) -> str:
         """
         Generate text with specific SAE features steered.
-
-        Adds the features' decoder directions into the residual stream. It deliberately does
-        not round-trip through decode(encode(x)): that discards ~24% of the residual norm and
-        raises CE loss even with no features selected. Multiplying encoded activations also
-        cannot work here, since a feature that is off at a position is exactly 0 and stays 0
-        at any multiplier.
 
         Args:
             prompt: Input prompt text
             boosted_features: Dict mapping feature indices to steering strengths
             max_new_tokens: Maximum number of tokens to generate
             temperature: Sampling temperature
+            max_steer_ratio: Cap on ||steer|| / ||residual||; defaults to MAX_STEER_RATIO
 
         Returns:
-            Generated text
+           the text from fwd pass after boosting 
         """
         if self.sae is None:
             raise ValueError("SAE not loaded. Call load_sae() first.")
 
         tokens = self.model.to_tokens(prompt)
         steer = self.steering_vector(boosted_features)
+        steer_norm = steer.norm()
+        ratio = self.MAX_STEER_RATIO if max_steer_ratio is None else max_steer_ratio
 
         def steer_hook(resid, hook):
-            # Never steer BOS - perturbing that outlier position derails generation.
-            # With KV caching the prompt arrives as one pass, then one token at a time.
-            if resid.shape[1] > 1:
-                resid[:, 1:, :] += steer
-            else:
-                resid += steer
+            if steer_norm == 0:
+                return resid
+            target = resid[:, 1:, :] if resid.shape[1] > 1 else resid
+            limit = ratio * target.norm(dim=-1, keepdim=True)
+            target += steer * torch.clamp(limit / steer_norm, max=1.0)
             return resid
 
         with self.model.hooks(fwd_hooks=[(self.hook_point, steer_hook)]):
@@ -208,22 +223,27 @@ class LatentExplorer:
 
         return stats
 
-    def get_pointmap(self, strategy: str = "umap3d", **kwargs) -> np.ndarray:
+    def get_pointmap(self, strategy: str = "umap3d", vectors=None, **kwargs) -> np.ndarray:
         """
         Compute 3D embedding of all SAE features.
 
         Args:
-            strategy: Embedding strategy - 'umap3d', 'pca2d+norm', 'pca2d+variance', 'umap2d+norm', etc.
+            strategy: Embedding strategy - 'umap3d', 'pca2d+norm', 'pca2d+variance', etc.
+            vectors: What to embed, [d_sae, dim]. Defaults to the SAE decoder directions,
+                which lay the map out by raw geometry. Passing the embeddings of each
+                feature's description instead lays it out by meaning, so that features
+                about cities, or about code, end up as neighbours.
             **kwargs: Additional arguments for the embedder
-
+    
         Returns:
             Array of shape [d_sae, 3] with (x, y, z) coordinates for each feature
         """
         if self.sae is None:
             raise ValueError("SAE not loaded. Call load_sae() first.")
 
-        embedder = get_embedder(strategy, **kwargs)
-        feature_weights = self.sae.W_dec
-        pointmap = embedder.compute_embedding(feature_weights)
+        if vectors is None:
+            vectors = self.sae.W_dec
+        elif not isinstance(vectors, torch.Tensor):
+            vectors = torch.as_tensor(vectors)
 
-        return pointmap
+        return get_embedder(strategy, **kwargs).compute_embedding(vectors)

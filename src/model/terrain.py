@@ -1,14 +1,11 @@
-"""Turn a 2D feature embedding into a continuous, navigable terrain.
-
-Height is a kernel density estimate over the feature positions: every feature drops a pile
-of sand, the piles overlap into a smooth surface, and dense clusters of related features
-become hills. Bandwidth controls how peaky the result is - small bandwidth gives sharp
-spikes per cluster, large bandwidth gives broad rolling hills.
-
+"""
 A gaussian KDE evaluated directly is O(grid_cells * points), which is 400M operations for
 a 128x128 grid over 24k features. Binning into a histogram and gaussian-blurring it is
 mathematically the same thing for a gaussian kernel, but runs in milliseconds.
 """
+import hashlib
+import os
+
 import numpy as np
 from scipy.ndimage import gaussian_filter
 from scipy.spatial import cKDTree
@@ -25,9 +22,9 @@ def spread_positions(xy: np.ndarray, world_size: float = 60.0,
     hi = np.percentile(xy, 100 - percentile, axis=0)
     span = np.maximum(hi - lo, 1e-6)
 
-    normalized = (xy - lo) / span            # roughly [0, 1]
+    normalized = (xy - lo) / span            
     normalized = np.clip(normalized, 0.0, 1.0)
-    return (normalized - 0.5) * world_size   # centered on the origin
+    return (normalized - 0.5) * world_size
 
 
 def kde_heightmap(xy_world: np.ndarray, world_size: float = 60.0, grid_size: int = 128,
@@ -51,7 +48,6 @@ def kde_heightmap(xy_world: np.ndarray, world_size: float = 60.0, grid_size: int
         xy_world[:, 1], xy_world[:, 0], bins=[edges, edges]  # row=y, col=x
     )
 
-    # sigma is in grid cells, so convert the bandwidth from world units
     cells_per_unit = grid_size / world_size
     density = gaussian_filter(density, sigma=bandwidth * cells_per_unit, mode="nearest")
 
@@ -63,12 +59,9 @@ def kde_heightmap(xy_world: np.ndarray, world_size: float = 60.0, grid_size: int
 
 def sample_heightmap(heightmap: np.ndarray, xy_world: np.ndarray,
                      world_size: float = 60.0) -> np.ndarray:
-    """Bilinearly sample terrain heights at arbitrary positions, so markers sit on the
-    surface rather than floating above or sinking into it."""
     grid_size = heightmap.shape[0]
     half = world_size / 2.0
 
-    # to continuous grid coordinates, offset by half a cell to hit cell centers
     g = (xy_world + half) / world_size * grid_size - 0.5
     g = np.clip(g, 0, grid_size - 1)
 
@@ -84,14 +77,9 @@ def sample_heightmap(heightmap: np.ndarray, xy_world: np.ndarray,
 
 def relax_positions(xy: np.ndarray, min_dist: float, iterations: int = 14,
                     strength: float = 0.6, bounds: float | None = None) -> np.ndarray:
-    """Push apart features that sit on top of each other, so they can be seen and clicked.
-
-    Scaling the world up alone does not help: UMAP output is clumpy, so a uniform scale
-    enlarges the clumps too and the local crowding is unchanged. This only acts on pairs
-    closer than min_dist, so tight clusters loosen while the global layout is preserved.
+    """Push apart features that sit on top of each other
     """
     pts = xy.astype(np.float64).copy()
-
     # exact duplicates have no direction to separate along, so nudge them apart first
     rng = np.random.default_rng(0)
     pts += rng.normal(0, min_dist * 1e-3, pts.shape)
@@ -117,3 +105,74 @@ def relax_positions(xy: np.ndarray, min_dist: float, iterations: int = 14,
             np.clip(pts, -bounds, bounds, out=pts)
 
     return pts
+
+
+def sample_surface(heightmap: np.ndarray, xy_world: np.ndarray,
+                   world_size: float = 60.0) -> np.ndarray:
+    """Height of the surface, matching the renderer's triangulation exactly.
+
+    THREE.PlaneGeometry splits each cell along the anti-diagonal, into triangles
+    (a, b, d) and (b, c, d) for a=(r,c) b=(r+1,c) c=(r+1,c+1) d=(r,c+1).
+    """
+    grid_size = heightmap.shape[0]
+    step = world_size / (grid_size - 1)
+    half = world_size / 2.0
+
+    gx = np.clip((xy_world[:, 0] + half) / step, 0, grid_size - 1.0 - 1e-9)
+    gz = np.clip((xy_world[:, 1] + half) / step, 0, grid_size - 1.0 - 1e-9)
+
+    c0 = gx.astype(int); r0 = gz.astype(int)
+    fx = gx - c0; fz = gz - r0
+
+    h_a = heightmap[r0, c0]
+    h_b = heightmap[r0 + 1, c0]
+    h_c = heightmap[r0 + 1, c0 + 1]
+    h_d = heightmap[r0, c0 + 1]
+
+    lower = h_a + fx * (h_d - h_a) + fz * (h_b - h_a)             # fx + fz <= 1
+    upper = h_c + (1 - fx) * (h_b - h_c) + (1 - fz) * (h_d - h_c)  # fx + fz >= 1
+    return np.where(fx + fz <= 1.0, lower, upper)
+
+
+def build_terrain(pointmap: np.ndarray, world_size: float, grid_size: int, bandwidth: float,
+                  max_height: float, min_gap: float, iterations: int = 30):
+    """Embedding -> (ground positions, heightmap, per-feature surface heights)."""
+    xy = spread_positions(pointmap[:, :2], world_size=world_size)
+    xy = relax_positions(xy, min_dist=min_gap, iterations=iterations, bounds=world_size / 2)
+    heights_grid = kde_heightmap(xy, world_size=world_size, grid_size=grid_size,
+                                 bandwidth=bandwidth, max_height=max_height)
+    return xy, heights_grid, sample_surface(heights_grid, xy, world_size=world_size)
+
+
+def _terrain_key(pointmap: np.ndarray, params: dict) -> str:
+    """Fingerprint of everything the terrain depends on."""
+    h = hashlib.blake2b(digest_size=16)
+    h.update(np.ascontiguousarray(pointmap, dtype=np.float64).tobytes())
+    for name in sorted(params):
+        h.update(f"{name}={params[name]!r};".encode())
+    return h.hexdigest()
+
+
+def load_or_build_terrain(cache_path: str, pointmap: np.ndarray, **params):
+    """Terrain from cache when it is still valid, otherwise rebuilt and cached.
+    """
+    key = _terrain_key(pointmap, params)
+
+    if os.path.exists(cache_path):
+        reason = None
+        try:
+            cached = np.load(cache_path, allow_pickle=False)
+            if str(cached["key"]) == key:
+                return cached["world_xy"], cached["heightmap"], cached["point_heights"], True
+            reason = "settings or pointmap changed"
+        except Exception as exc:
+            reason = f"unreadable ({exc})"
+        print(f"  terrain cache stale ({reason}), rebuilding")
+
+    world_xy, heights_grid, point_heights = build_terrain(pointmap, **params)
+    try:
+        np.savez_compressed(cache_path, world_xy=world_xy, heightmap=heights_grid,
+                            point_heights=point_heights, key=key)
+    except OSError as exc:
+        print(f"  could not write terrain cache: {exc}")
+    return world_xy, heights_grid, point_heights, False

@@ -1,15 +1,3 @@
-"""Semantic similarity scoring for the guessing game.
-
-Uses GPT-2's own token embedding matrix (W_E) as the word2vec table, so there is no extra
-model to download. A plain mean-pool over W_E barely separates related from unrelated text
-(everything lands in 0.58-0.84) because frequent function words dominate the average. Two
-corrections fix that and roughly double the margin:
-
-  - subtract the vocabulary-mean embedding, removing the common direction
-  - drop stopword tokens and unit-normalize the rest before averaging
-
-Measured on held-out pairs: paraphrases 0.42-0.73, unrelated 0.04-0.26.
-"""
 import torch
 import torch.nn.functional as F
 from abc import ABC, abstractmethod
@@ -64,7 +52,6 @@ class Word2VecScorer(SimilarityScorer):
         with torch.no_grad():
             ids = self.model.to_tokens(text)[0][1:].tolist()  # drop BOS
             if self.drop_stopwords:
-                # keep the raw tokens if filtering would leave nothing to compare
                 ids = [i for i in ids if i not in self.stop_ids] or ids
             if not ids:
                 return torch.zeros_like(self.vocab_mean)
@@ -79,10 +66,7 @@ class Word2VecScorer(SimilarityScorer):
 
 
 class SAEFeatureScorer(SimilarityScorer):
-    """Cosine similarity in the SAE feature space the game is actually played in.
-
-    Scores how close you got in latent space rather than in word space, so it rewards
-    landing on the right features even when the surface wording differs.
+    """Cosine similarity in the SAE feature space 
     """
 
     def __init__(self, explorer):
