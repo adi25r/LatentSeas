@@ -7,7 +7,8 @@ sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'model'))
 
 from model import LatentExplorer
 from scoring import get_scorer
-from terrain import spread_positions, relax_positions, kde_heightmap, sample_heightmap
+from terrain import load_or_build_terrain
+from explanations import load_or_fetch, structural_scores
 import torch
 import numpy as np
 
@@ -25,16 +26,23 @@ app.add_middleware(
 explorer = None
 scorer = None
 pointmap = None
+descriptions = None
 feature_indices = None
 placed_flags = {}  # feature_idx -> steering strength
+eligible = None
+discovered = set()  # feature indices whose identity the player has dug up
 
 class ProbeRequest(BaseModel):
     sentence: str
-    threshold: float = 1.0
+    threshold: float = 10.0
 
 class FlagRequest(BaseModel):
     feature_idx: int
     strength: float = 40.0
+
+
+class DigRequest(BaseModel):
+    feature_idx: int
 
 class GenerateRequest(BaseModel):
     prompt: str
@@ -48,7 +56,13 @@ class ScoreRequest(BaseModel):
     target: str
     prompt: str | None = None      # stripped before scoring so it cannot inflate the score
 
-POINTMAP_CACHE = os.path.join(os.path.dirname(__file__), "pointmap_cache.npy")
+POINTMAP_CACHE = os.path.join(os.path.dirname(__file__), "pointmap_semantic.npy")
+EXPLANATIONS_CACHE = os.path.join(os.path.dirname(__file__), "explanations_cache.npz")
+
+# Descriptions above this score are about formatting rather than meaning; they fire on
+# almost any sentence and are useless (actively harmful) as steering targets.
+STRUCTURAL_THRESHOLD = 0.50
+TERRAIN_CACHE = os.path.join(os.path.dirname(__file__), "terrain_cache.npz")
 
 # Terrain shape. WORLD_SIZE spreads the features apart for visibility and clicking without
 # touching the embedding itself; BANDWIDTH is the KDE sand-pile width, so smaller is peakier.
@@ -67,6 +81,7 @@ point_heights = None
 @app.on_event("startup")
 async def startup_event():
     global explorer, scorer, pointmap, feature_indices, world_xy, heightmap, point_heights
+    global descriptions, eligible
 
     print("Loading model...")
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -74,30 +89,46 @@ async def startup_event():
     explorer.load_sae()
     scorer = get_scorer("word2vec", model=explorer.model)
 
+    # What each feature actually responds to, in words. Without this the map is 24k
+    # anonymous indices; with it every point is a named concept.
+    d_sae = explorer.sae.cfg.d_sae
+    descriptions, description_vectors, labelled = load_or_fetch(EXPLANATIONS_CACHE, d_sae=d_sae)
+
+    # A feature is worth probing only if we can say what it means and it is not structural.
+    structural = structural_scores(description_vectors) if description_vectors.size else np.zeros(d_sae)
+    eligible = labelled & (structural <= STRUCTURAL_THRESHOLD)
+    print(f"{int(labelled.sum())}/{d_sae} features described, "
+          f"{int(eligible.sum())} usable ({int((~eligible).sum())} structural or unlabelled)")
+
     # The map must cover every feature, since a probe can surface any of them.
-    # UMAP over all 24k features takes a few minutes, so cache it to disk.
     if os.path.exists(POINTMAP_CACHE):
         print(f"Loading cached pointmap from {POINTMAP_CACHE}")
         pointmap = np.load(POINTMAP_CACHE)
     else:
-        print(f"Computing pointmap for all {explorer.sae.cfg.d_sae} features (one-time, slow)...")
-        pointmap = explorer.get_pointmap(strategy="umap3d", n_neighbors=15)
+        # Lay the map out over the *descriptions*, not the decoder directions. Embedding
+        # raw decoder geometry puts "references to dogs" next to "the end of the document";
+        # embedding what the features mean puts it next to cats, bears and pets.
+        print(f"Computing semantic pointmap for {d_sae} features (one-time, ~20s)...")
+        norms = np.linalg.norm(description_vectors, axis=1, keepdims=True)
+        unit = description_vectors / np.maximum(norms, 1e-9)
+        pointmap = explorer.get_pointmap(strategy="umap3d", vectors=unit, n_neighbors=15)
         np.save(POINTMAP_CACHE, pointmap)
         print(f"Cached pointmap to {POINTMAP_CACHE}")
 
     feature_indices = list(range(pointmap.shape[0]))
 
     # Ground positions come from the embedding; height is feature density, so clusters
-    # of related features read as hills you can navigate by.
-    world_xy = spread_positions(pointmap[:, :2], world_size=WORLD_SIZE)
-    world_xy = relax_positions(world_xy, min_dist=MIN_FEATURE_GAP, iterations=30,
-                               bounds=WORLD_SIZE / 2)
-    heightmap = kde_heightmap(world_xy, world_size=WORLD_SIZE, grid_size=GRID_SIZE,
-                              bandwidth=BANDWIDTH, max_height=MAX_HEIGHT)
-    point_heights = sample_heightmap(heightmap, world_xy, world_size=WORLD_SIZE)
+    # of related features read as hills you can navigate by. Cached between launches, and
+    # the cache key covers every setting below so tuning them rebuilds automatically.
+    world_xy, heightmap, point_heights, cached = load_or_build_terrain(
+        TERRAIN_CACHE, pointmap,
+        world_size=WORLD_SIZE, grid_size=GRID_SIZE, bandwidth=BANDWIDTH,
+        max_height=MAX_HEIGHT, min_gap=MIN_FEATURE_GAP, iterations=30,
+    )
 
     print(f"API ready with {len(feature_indices)} features on a "
-          f"{WORLD_SIZE:.0f}x{WORLD_SIZE:.0f} terrain (KDE bandwidth {BANDWIDTH})")
+          f"{WORLD_SIZE:.0f}x{WORLD_SIZE:.0f} terrain (KDE bandwidth {BANDWIDTH}"
+          f"{', cached' if cached else ', built'})")
 
 @app.get("/")
 async def root():
@@ -120,7 +151,11 @@ async def get_pointmap():
         "world_size": WORLD_SIZE,
         "max_height": MAX_HEIGHT,
         "bandwidth": BANDWIDTH,
-        "min_gap": MIN_FEATURE_GAP
+        "min_gap": MIN_FEATURE_GAP,
+        # Only what the player has dug up. Everything else is an unmarked mound, which is
+        # the point - the map is a thing to survey, not a labelled index.
+        "known": {str(i): descriptions[i] for i in discovered},
+        "diggable": eligible.tolist() if eligible is not None else []
     }
 
 @app.post("/probe")
@@ -129,21 +164,26 @@ async def probe_sentence(request: ProbeRequest):
     if explorer is None:
         return {"error": "Model not loaded"}
 
-    # BOS is excluded inside get_feature_activations - without that every sentence
-    # returns the same handful of huge BOS-artifact features.
-    feature_acts = explorer.get_feature_activations(request.sentence)
-    max_acts = feature_acts.max(dim=0).values
+    sentence = request.sentence.strip()
+    if not sentence or len(sentence.split()) > 1:
+        return {"error": "probe a single word only"}
 
-    # Rank instead of scanning all 24k in python; a probe is sparse anyway.
-    top_values, top_indices = torch.topk(max_acts, k=min(64, max_acts.shape[0]))
+    # Ranked by raw activation among non-structural features. BOS is excluded inside
+    # get_feature_activations; without that every sentence returns the same handful of
+    # huge BOS artifacts. There is no "background" text to rank against - eligible already
+    # excludes formatting features by their actual description-embedding direction.
+    ranked = explorer.probe(sentence, top_k=5, eligible=eligible)
 
     activated = []
-    for act, idx in zip(top_values.tolist(), top_indices.tolist()):
-        if act <= request.threshold:
-            break
+    for idx, act in ranked:
+        if act < request.threshold:
+            continue
         activated.append({
             "feature_idx": idx,
-            "activation": act,
+            # withheld until dug up
+            "label": descriptions[idx] if idx in discovered else None,
+            "discovered": idx in discovered,
+            "activation": round(act, 2),
             # what this feature naturally fires at here - a sane default steering strength
             "suggested_strength": round(act, 2),
             "position": [round(float(world_xy[idx, 0]), 3),
@@ -152,7 +192,7 @@ async def probe_sentence(request: ProbeRequest):
         })
 
     return {
-        "sentence": request.sentence,
+        "sentence": sentence,
         "activated_features": activated,
         "count": len(activated)
     }
@@ -162,6 +202,8 @@ async def place_flag(request: FlagRequest):
     """Place or update a flag at a feature location"""
     if request.feature_idx not in feature_indices:
         return {"error": "Invalid feature index"}
+    if request.feature_idx not in discovered:
+        return {"error": "Dig this one up first", "feature_idx": request.feature_idx}
 
     placed_flags[request.feature_idx] = request.strength
 
@@ -187,6 +229,7 @@ async def get_flags():
         "flags": [
             {
                 "feature_idx": idx,
+                "label": descriptions[idx] if idx in discovered else None,
                 "strength": strength,
                 "position": [round(float(world_xy[idx, 0]), 3),
                              round(float(point_heights[idx]), 3),
@@ -196,6 +239,39 @@ async def get_flags():
         ],
         "count": len(placed_flags)
     }
+
+@app.post("/dig")
+async def dig(request: DigRequest):
+    """Reveal what a feature responds to. The client gates this on standing next to it."""
+    idx = request.feature_idx
+    if idx not in feature_indices:
+        return {"error": "Invalid feature index"}
+    if eligible is not None and not eligible[idx]:
+        return {"error": "Nothing but formatting noise buried here", "feature_idx": idx}
+
+    first_time = idx not in discovered
+    discovered.add(idx)
+    return {
+        "feature_idx": idx,
+        "label": descriptions[idx],
+        "newly_discovered": first_time,
+        "total_discovered": len(discovered)
+    }
+
+
+@app.get("/discovered")
+async def get_discovered():
+    return {"features": {str(i): descriptions[i] for i in sorted(discovered)},
+            "count": len(discovered)}
+
+
+@app.delete("/discovered")
+async def reset_discovered():
+    """Start a fresh run with the map unknown again."""
+    discovered.clear()
+    placed_flags.clear()
+    return {"success": True}
+
 
 def strip_prompt(generated: str, prompt: str | None) -> str:
     """Score only what the model added. The shared prompt is common to every attempt,
