@@ -13,14 +13,11 @@ import net.minecraftforge.event.level.BlockEvent;
 import net.minecraftforge.eventbus.api.SubscribeEvent;
 
 /**
- * Turns edits on a feature's single block into steering state: once discovered
- * (RevealHandler - hold sneak nearby), replacing that block with a diamond block boosts it
- * (MaterialPalette.BOOST - simplified from an earlier multi-tier system after playtesting
- * showed it added complexity without adding fun); breaking it deactivates the feature
- * entirely, since there's nothing left there to represent it. Right-click is kept as a
- * manual on/off toggle at baseline strength, independent of any block swap. Edits on an
- * undiscovered feature, or anywhere that isn't a feature's block at all
- * (BlobIndex.featureAt returns -1), do nothing.
+ * Turns edits on a discovered feature's block into steering state: replacing it with a
+ * diamond block (MaterialPalette.BOOST) boosts it; breaking it deactivates the feature.
+ * Right-click is a manual on/off toggle at baseline strength. Edits on an undiscovered
+ * feature, or anywhere that isn't a feature's block (BlobIndex.featureAt returns -1), do
+ * nothing.
  */
 public final class BlockTrackingHandler {
     private BlockTrackingHandler() {}

@@ -14,11 +14,9 @@ import java.util.HashSet;
 import java.util.Set;
 
 /**
- * Drops a player into the feature dimension on login and on respawn (dying anywhere sends
- * you back to vanilla Overworld spawn otherwise) - the whole point of this mod is that
- * world, so nobody should have to find their own way in. Waits for WorldBuilder to confirm
- * blocks are actually on the ground first: teleporting in mid-build once cost a player a
- * fatal fall into the void, since a queued-but-undrained world has nothing under y=84 yet.
+ * Drops a player into the feature dimension on login and on respawn. Waits for
+ * WorldBuilder.isReady() first, since a queued-but-undrained world has nothing under the
+ * spawn point yet.
  */
 public final class PlayerGateway {
     private PlayerGateway() {}

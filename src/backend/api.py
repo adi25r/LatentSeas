@@ -74,19 +74,11 @@ MAX_HEIGHT = 8.0
 # crowded pairs are pushed apart directly; the global layout barely moves.
 MIN_FEATURE_GAP = 0.7
 
-# Each feature is now a single block (not a multi-block blob), so it no longer needs the
-# wide clearance a blob did to avoid swallowing its neighbours - 20x, then 10x, both proved
-# too large in playtesting (both a crash risk from the sheer chunk count, and later just
-# "too sparse to feel like a world"). 4x keeps real, deliberate walking room between
-# features without the world ballooning: area scales with MC_SCALE^2, so dropping from 10x
-# to 4x is a ~6x reduction in total terrain footprint too. Built lazily (see
-# _get_mc_terrain) since not every session runs the mod, and cached separately so tuning it
-# never disturbs the web game's terrain.
 MC_SCALE = 4
 MC_WORLD_SIZE = WORLD_SIZE * MC_SCALE
 MC_GRID_SIZE = 320
 MC_BANDWIDTH = BANDWIDTH * MC_SCALE
-MC_MAX_HEIGHT = MAX_HEIGHT
+MC_MAX_HEIGHT = 48.0
 MC_MIN_FEATURE_GAP = MIN_FEATURE_GAP * MC_SCALE
 MC_TERRAIN_CACHE = os.path.join(os.path.dirname(__file__), "terrain_cache_mc.npz")
 
@@ -158,12 +150,6 @@ def _get_mc_terrain():
     disk from then on (see MC_* constants above for why this can't just reuse world_xy)."""
     global mc_world_xy, mc_heightmap, mc_point_heights
     if mc_world_xy is None:
-        # 30 iterations (the web game's setting) isn't enough to fully untangle a genuine
-        # pileup - some features start out numerically identical (near-duplicate
-        # description embeddings) or clipped to the same world-square edge by
-        # spread_positions's percentile clamp, and repulsion from ~0 apart to 14 apart
-        # takes real iteration count. This build is cached to disk, so paying for more
-        # iterations once is cheap relative to leaving 2% of blobs overlapping forever.
         mc_world_xy, mc_heightmap, mc_point_heights, cached = load_or_build_terrain(
             MC_TERRAIN_CACHE, pointmap,
             world_size=MC_WORLD_SIZE, grid_size=MC_GRID_SIZE, bandwidth=MC_BANDWIDTH,

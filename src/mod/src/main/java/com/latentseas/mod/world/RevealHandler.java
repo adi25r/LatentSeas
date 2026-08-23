@@ -13,12 +13,7 @@ import java.util.Objects;
 import java.util.UUID;
 
 /**
- * Walk up to an undiscovered blob and hold sneak (shift) for ~1.2s to reveal what it is -
- * this is the Minecraft translation of the old web game's "hold E to dig", moved off
- * block-breaking entirely per the current design: breaking/placing blocks is now purely
- * the boost/weaken mechanic (BlockTrackingHandler), gated on a blob already being
- * discovered. Sneak was picked over a custom keybinding to avoid the client-side key
- * registration + packet-syncing that would otherwise be needed for a dedicated key.
+ * Hold sneak (shift) next to an undiscovered feature for ~1.2s to reveal it.
  */
 public final class RevealHandler {
     private RevealHandler() {}
@@ -64,14 +59,6 @@ public final class RevealHandler {
         }
     }
 
-    // Checks the exact block positions around the player's feet via BlobIndex's O(1) lookup,
-    // rather than scanning every blob origin for whichever is "nearest within some radius".
-    // With feature spacing now as tight as ~2.5 blocks median, a radius search wide enough
-    // to reach a feature you're standing next to was also wide enough to catch several
-    // other undiscovered neighbours - the "nearest" one flickered between them on tiny
-    // movement, so holding sneak by one feature could end up revealing a different one each
-    // time. Exact adjacency has no such ambiguity: it only ever finds the feature you're
-    // actually standing at.
     private static int nearestUndiscoveredBlob(ServerPlayer player) {
         LatentSeasSavedData data = LatentSeasSavedData.get(player.getServer());
         BlockPos feet = player.blockPosition();
