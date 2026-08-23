@@ -7,7 +7,9 @@ An interactive browser game for exploring the latent space of GPT-2 using Sparse
 Navigate the "landscape" of GPT-2's latent space by placing "flags" that activate specific SAE features. The model generates outputs based on your flag placements, creating interesting and emergent behaviors.
 
 **The 3D World:**
-- **(x, y)** = ground position, from a UMAP embedding of the SAE decoder directions
+- Every point is a **named concept** — "references to dogs", "the keyword return in
+  programming contexts", "terms related to funerals" 
+- **(x, y)** = ground position, from a UMAP embedding of what each feature *means*
 - **height** = feature *density*, as a kernel density estimate
 - Every feature drops a pile of sand; the piles overlap into a continuous surface, so
   clusters of related features become hills you can navigate by
@@ -16,10 +18,13 @@ Navigate the "landscape" of GPT-2's latent space by placing "flags" that activat
 
 **Gameplay:**
 1. You're given a target sentence
-2. Probe it - the SAE lights up its feature locations on the map
-3. Navigate the terrain and place flags at the lit locations
-4. Generate text steered by your placed flags
-5. Score on semantic similarity to the target
+2. You can probe the landscape, but you need to explore what it highlights to determine what is relevant 
+3. Click a site to set a waypoint, walk to it, hold **E** to dig
+4. Digging reveals what that feature responds to, and puts it to work as a flag
+5. Generate, and score on semantic similarity to the target
+
+The map starts unknown. Probing tells you *where* to look, never *what* you will find —
+so the terrain is something to survey, and a run leaves you knowing part of the model.
 
 ## Setup
 
@@ -95,7 +100,7 @@ steered = explorer.generate_with_boosted_features(
 
 The backend provides a RESTful API:
 
-- `GET /pointmap` - Get 3D coordinates of all features
+- `GET /pointmap` - Feature positions, the KDE heightmap, and the labels you have earned
 - `POST /probe` - Analyze a sentence and get activated features
   ```json
   {"sentence": "Hello world", "threshold": 1.0}
@@ -104,6 +109,12 @@ The backend provides a RESTful API:
   ```json
   {"feature_idx": 3986, "strength": 40.0}
   ```
+  Refused with `{"error": "Dig this one up first"}` for anything not yet discovered.
+- `POST /dig` - Reveal what a feature responds to; required before it can be flagged
+  ```json
+  {"feature_idx": 3986}
+  ```
+- `GET /discovered` / `DELETE /discovered` - What you have dug up, and start a fresh run
 - `DELETE /flag/{feature_idx}` - Remove a flag
 - `GET /flags` - Get all placed flags
 - `POST /generate` - Generate text with boosted features
@@ -118,26 +129,6 @@ The backend provides a RESTful API:
 
 `POST /generate` also accepts an optional `target`; when present the response carries
 `score`, `target`, and `scored_text`.
-
-## How to Play
-
-1. **Probe a sentence** - Enter any sentence to see which features light up on the map
-2. **Navigate the terrain** - Use W/A/S/D to walk around, right-click drag to look
-3. **Place flags** - Left-click on red (activated) features to place flags
-4. **Generate** - Hit generate to see what text the model creates with your placed flags
-5. **Experiment** - Try different combinations and see what happens!
-
-## How Steering Works
-
-`W_dec` rows are unit norm, so strength is in residual-norm units and is directly
-comparable to how hard a feature naturally fires:
-
-- **20-50** — the natural range. Coherent English, clearly on-topic.
-- **60-80** — strong steering, grammar starts to fray.
-- **100+** — degenerate. At 200 you get `dog dog dog dog dog`.
-
-The probe reports each feature's own activation as `suggested_strength`, which is a good
-default: it asks the feature to fire about as hard as it did in your probe sentence.
 
 ## Scoring
 
